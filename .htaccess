@@ -1,0 +1,7 @@
+Options -Indexes
+
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteRule ^$ public/index.php [L]
+RewriteRule ^(index\.php|about\.php|download\.php|style\.css)$ public/$1 [L]
+</IfModule>
