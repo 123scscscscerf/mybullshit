@@ -143,35 +143,89 @@ public sealed class MainShellForm : Form
     private void BuildAdminGroups()
     {
         var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 320 };
-        var gl = Theme.Grid(); var st = Theme.Grid();
+        var gl = Theme.Grid();
+        var st = Theme.Grid();
+
         var leftTop = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 42 };
         var gname = new TextBox { Width = 150 };
-        leftTop.Controls.AddRange(new Control[] { gname, Theme.Btn("Create", (_, _) => { if (string.IsNullOrWhiteSpace(gname.Text)) return; EngineDb.AddGroup(gname.Text.Trim(), _me.Id); gname.Clear(); ReloadGroups(); }), Theme.Btn("Rename", (_, _) => { if (gl.CurrentRow?.DataBoundItem is not Group g) return; var n = Microsoft.VisualBasic.Interaction.InputBox("Name", "Rename", g.Name); if (!string.IsNullOrWhiteSpace(n)) { EngineDb.RenameGroup(g.Id, n, _me.Id); ReloadGroups(); } }), Theme.Btn("Delete", (_, _) => { if (gl.CurrentRow?.DataBoundItem is Group g) { EngineDb.DeleteGroup(g.Id, _me.Id); ReloadGroups(); } }) });
-        split.Panel1.Controls.Add(gl); split.Panel1.Controls.Add(leftTop);
 
         var rt = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 42 };
         var filter = new TextBox { Width = 140 };
         var cmb = new ComboBox { Width = 200, DropDownStyle = ComboBoxStyle.DropDownList };
+
+        void ReloadMembers()
+        {
+            if (gl.CurrentRow?.DataBoundItem is Group g)
+                st.DataSource = EngineDb.GetGroupStudents(g.Id);
+        }
+
+        void LoadStudents()
+        {
+            var query = EngineDb.GetUsers().Where(x => x.Role == UserRole.Student && x.IsActive);
+            var ftxt = filter.Text?.Trim();
+            if (!string.IsNullOrWhiteSpace(ftxt))
+                query = query.Where(x => x.DisplayName.Contains(ftxt, StringComparison.OrdinalIgnoreCase) || x.Login.Contains(ftxt, StringComparison.OrdinalIgnoreCase));
+            cmb.DataSource = query.ToList();
+            cmb.DisplayMember = "DisplayName";
+        }
+
+        void ReloadGroups()
+        {
+            gl.DataSource = EngineDb.GetGroups();
+            LoadStudents();
+            ReloadMembers();
+        }
+
+        var createBtn = Theme.Btn("Create", (_, _) =>
+        {
+            if (string.IsNullOrWhiteSpace(gname.Text)) return;
+            EngineDb.AddGroup(gname.Text.Trim(), _me.Id);
+            gname.Clear();
+            ReloadGroups();
+        });
+
+        var renameBtn = Theme.Btn("Rename", (_, _) =>
+        {
+            if (gl.CurrentRow?.DataBoundItem is not Group g) return;
+            var n = Microsoft.VisualBasic.Interaction.InputBox("Name", "Rename", g.Name);
+            if (string.IsNullOrWhiteSpace(n)) return;
+            EngineDb.RenameGroup(g.Id, n.Trim(), _me.Id);
+            ReloadGroups();
+        });
+
+        var deleteBtn = Theme.Btn("Delete", (_, _) =>
+        {
+            if (gl.CurrentRow?.DataBoundItem is not Group g) return;
+            EngineDb.DeleteGroup(g.Id, _me.Id);
+            ReloadGroups();
+        });
+
         var addBtn = Theme.Btn("Add", (_, _) =>
         {
             if (gl.CurrentRow?.DataBoundItem is not Group g || cmb.SelectedItem is not User u) return;
             EngineDb.SetGroupMember(g.Id, u.Id, true, _me.Id);
             ReloadMembers();
         });
+
         var removeBtn = Theme.Btn("Remove", (_, _) =>
         {
             if (gl.CurrentRow?.DataBoundItem is not Group g || st.CurrentRow?.DataBoundItem is not User u) return;
             EngineDb.SetGroupMember(g.Id, u.Id, false, _me.Id);
             ReloadMembers();
         });
+
+        leftTop.Controls.AddRange(new Control[] { gname, createBtn, renameBtn, deleteBtn });
         rt.Controls.AddRange(new Control[] { new Label { Text = "Filter" }, filter, cmb, addBtn, removeBtn });
-        split.Panel2.Controls.Add(st); split.Panel2.Controls.Add(rt);
+
+        split.Panel1.Controls.Add(gl);
+        split.Panel1.Controls.Add(leftTop);
+        split.Panel2.Controls.Add(st);
+        split.Panel2.Controls.Add(rt);
         _work.Controls.Add(split);
 
-        void ReloadGroups() { gl.DataSource = EngineDb.GetGroups(); LoadStudents(); }
-        void LoadStudents() { var q = EngineDb.GetUsers().Where(x => x.Role == UserRole.Student && x.IsActive); if (!string.IsNullOrWhiteSpace(filter.Text)) q = q.Where(x => x.DisplayName.Contains(filter.Text, StringComparison.OrdinalIgnoreCase) || x.Login.Contains(filter.Text, StringComparison.OrdinalIgnoreCase)); cmb.DataSource = q.ToList(); cmb.DisplayMember = "DisplayName"; }
-        void ReloadMembers() { if (gl.CurrentRow?.DataBoundItem is Group g) st.DataSource = EngineDb.GetGroupStudents(g.Id); }
-        gl.SelectionChanged += (_, _) => ReloadMembers(); filter.TextChanged += (_, _) => LoadStudents();
+        gl.SelectionChanged += (_, _) => ReloadMembers();
+        filter.TextChanged += (_, _) => LoadStudents();
+
         ReloadGroups();
     }
 
@@ -349,7 +403,7 @@ public sealed class AttemptPlayerForm : Form
         if (_qPanel.Controls.OfType<FlowLayoutPanel>().FirstOrDefault() is FlowLayoutPanel p)
         {
             if ((p.Tag as string) == "single") json = JsonUtil.To(new { selectedOptionId = p.Controls.OfType<RadioButton>().FirstOrDefault(x => x.Checked)?.Tag as long? ?? 0L });
-            if ((p.Tag as string) == "multi") json = JsonUtil.To(new { selectedOptionIds = p.Controls.OfType<CheckBox>().Where(x => x.Checked).Select(x => (long)x.Tag).ToArray() });
+            if ((p.Tag as string) == "multi") json = JsonUtil.To(new { selectedOptionIds = p.Controls.OfType<CheckBox>().Where(x => x.Checked).Select(x => x.Tag is long l ? l : 0L).Where(x => x != 0L).ToArray() });
         }
         if (_qPanel.Controls.OfType<TextBox>().FirstOrDefault() is TextBox tb) json = JsonUtil.To(new { text = tb.Text });
         if (_qPanel.Controls.OfType<NumericUpDown>().FirstOrDefault() is NumericUpDown n) json = JsonUtil.To(new { value = (double)n.Value });
