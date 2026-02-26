@@ -150,8 +150,21 @@ public sealed class MainShellForm : Form
         split.Panel1.Controls.Add(gl); split.Panel1.Controls.Add(leftTop);
 
         var rt = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 42 };
-        var filter = new TextBox { Width = 140 }; var cmb = new ComboBox { Width = 200, DropDownStyle = ComboBoxStyle.DropDownList };
-        rt.Controls.AddRange(new Control[] { new Label { Text = "Filter" }, filter, cmb, Theme.Btn("Add", (_, _) => { if (gl.CurrentRow?.DataBoundItem is not Group g || cmb.SelectedItem is not User u) return; EngineDb.SetGroupMember(g.Id, u.Id, true, _me.Id); ReloadMembers(); }), Theme.Btn("Remove", (_, _) => { if (gl.CurrentRow?.DataBoundItem is not Group g || st.CurrentRow?.DataBoundItem is not User u) return; EngineDb.SetGroupMember(g.Id, u.Id, false, _me.Id); ReloadMembers(); }) });
+        var filter = new TextBox { Width = 140 };
+        var cmb = new ComboBox { Width = 200, DropDownStyle = ComboBoxStyle.DropDownList };
+        var addBtn = Theme.Btn("Add", (_, _) =>
+        {
+            if (gl.CurrentRow?.DataBoundItem is not Group g || cmb.SelectedItem is not User u) return;
+            EngineDb.SetGroupMember(g.Id, u.Id, true, _me.Id);
+            ReloadMembers();
+        });
+        var removeBtn = Theme.Btn("Remove", (_, _) =>
+        {
+            if (gl.CurrentRow?.DataBoundItem is not Group g || st.CurrentRow?.DataBoundItem is not User u) return;
+            EngineDb.SetGroupMember(g.Id, u.Id, false, _me.Id);
+            ReloadMembers();
+        });
+        rt.Controls.AddRange(new Control[] { new Label { Text = "Filter" }, filter, cmb, addBtn, removeBtn });
         split.Panel2.Controls.Add(st); split.Panel2.Controls.Add(rt);
         _work.Controls.Add(split);
 
@@ -279,7 +292,7 @@ public sealed class AttemptPlayerForm : Form
         Theme.Apply(this); Text = "Прохождение теста";
         var a = EngineDb.GetAttempt(attemptId); _snap = JsonUtil.From<AttemptSnapshot>(a.SnapshotJson);
         var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 48 };
-        bottom.Controls.AddRange(new Control[] { Theme.Btn("Back", (_, _) => Move(-1)), Theme.Btn("Next", (_, _) => { SaveCurrent(); Move(1); }), Theme.Btn("Save", (_, _) => SaveCurrent()), Theme.Btn("Submit", (_, _) => { SaveCurrent(); AttemptLogic.SubmitAttempt(_attemptId, "manual"); Close(); }, true) });
+        bottom.Controls.AddRange(new Control[] { Theme.Btn("Back", (_, _) => NavigateQuestion(-1)), Theme.Btn("Next", (_, _) => { SaveCurrent(); NavigateQuestion(1); }), Theme.Btn("Save", (_, _) => SaveCurrent()), Theme.Btn("Submit", (_, _) => { SaveCurrent(); AttemptLogic.SubmitAttempt(_attemptId, "manual"); Close(); }, true) });
         Controls.Add(_qPanel); Controls.Add(_nav); Controls.Add(bottom); Controls.Add(_timer);
         _nav.Items.AddRange(_snap.Questions.Select((x, i) => $"{i + 1}. {x.Type}").ToArray());
         _nav.SelectedIndexChanged += (_, _) => { if (_nav.SelectedIndex >= 0) { _idx = _nav.SelectedIndex; RenderQuestion(); } };
@@ -306,7 +319,7 @@ public sealed class AttemptPlayerForm : Form
         if (r == DialogResult.Yes) { SaveCurrent(); AttemptLogic.SubmitAttempt(_attemptId, "manual"); }
     }
 
-    private void Move(int d) { var n = _idx + d; if (n < 0 || n >= _snap.Questions.Count) return; _nav.SelectedIndex = n; }
+    private void NavigateQuestion(int d) { var n = _idx + d; if (n < 0 || n >= _snap.Questions.Count) return; _nav.SelectedIndex = n; }
 
     private void RenderQuestion()
     {
@@ -335,8 +348,8 @@ public sealed class AttemptPlayerForm : Form
         string json = "{}";
         if (_qPanel.Controls.OfType<FlowLayoutPanel>().FirstOrDefault() is FlowLayoutPanel p)
         {
-            if ((string)p.Tag == "single") json = JsonUtil.To(new { selectedOptionId = p.Controls.OfType<RadioButton>().FirstOrDefault(x => x.Checked)?.Tag as long? ?? 0L });
-            if ((string)p.Tag == "multi") json = JsonUtil.To(new { selectedOptionIds = p.Controls.OfType<CheckBox>().Where(x => x.Checked).Select(x => (long)x.Tag).ToArray() });
+            if ((p.Tag as string) == "single") json = JsonUtil.To(new { selectedOptionId = p.Controls.OfType<RadioButton>().FirstOrDefault(x => x.Checked)?.Tag as long? ?? 0L });
+            if ((p.Tag as string) == "multi") json = JsonUtil.To(new { selectedOptionIds = p.Controls.OfType<CheckBox>().Where(x => x.Checked).Select(x => (long)x.Tag).ToArray() });
         }
         if (_qPanel.Controls.OfType<TextBox>().FirstOrDefault() is TextBox tb) json = JsonUtil.To(new { text = tb.Text });
         if (_qPanel.Controls.OfType<NumericUpDown>().FirstOrDefault() is NumericUpDown n) json = JsonUtil.To(new { value = (double)n.Value });
