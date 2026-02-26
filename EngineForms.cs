@@ -4,7 +4,7 @@ using System.Drawing;
 using System.Linq;
 using System.Windows.Forms;
 
-namespace TestingPlatform;
+namespace PlatformApp;
 
 public static class Program
 {
@@ -19,420 +19,359 @@ public static class Program
 
 public sealed class LoginForm : Form
 {
-    private readonly ComboBox _users = new() { Dock = DockStyle.Top, DropDownStyle = ComboBoxStyle.DropDownList };
-    private readonly Button _login = new() { Dock = DockStyle.Top, Height = 36, Text = "Войти" };
+    private readonly TextBox _login = new() { Width = 260 };
+    private readonly TextBox _password = new() { Width = 260, PasswordChar = '•' };
+    private readonly Dictionary<string, (int count, DateTime until)> _fails = new();
 
     public LoginForm()
     {
-        Text = "Login"; Width = 400; Height = 180;
-        Controls.Add(_login); Controls.Add(_users);
-        Load += (_, _) => { _users.DataSource = EngineDb.GetUsers(); _users.DisplayMember = "Name"; };
-        _login.Click += (_, _) =>
+        Theme.Apply(this);
+        Text = "Платформа тестирования — Вход";
+        Width = 460; Height = 320; MinimumSize = new Size(460, 320);
+        var card = new Panel { Dock = DockStyle.Fill, Padding = new Padding(24), BackColor = Theme.Panel };
+        var lay = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1 };
+        lay.Controls.Add(new Label { Text = "Вход", Font = Theme.HeaderFont, AutoSize = true });
+        lay.Controls.Add(new Label { Text = "Login" }); lay.Controls.Add(_login);
+        lay.Controls.Add(new Label { Text = "Password" }); lay.Controls.Add(_password);
+        lay.Controls.Add(Theme.Btn("Войти", OnLogin, true));
+        card.Controls.Add(lay);
+        Controls.Add(card);
+    }
+
+    private void OnLogin(object? s, EventArgs e)
+    {
+        var key = _login.Text.Trim().ToLowerInvariant();
+        if (_fails.TryGetValue(key, out var f) && f.until > DateTime.UtcNow)
         {
-            if (_users.SelectedItem is not User u) return;
-            Hide();
-            using var mf = new MainForm(u);
-            mf.ShowDialog();
-            Show();
-        };
+            MessageBox.Show("Слишком много попыток. Подождите 2 минуты.");
+            return;
+        }
+
+        var u = EngineDb.FindByLogin(_login.Text.Trim());
+        if (u == null || !u.IsActive || !Security.Verify(_password.Text, u.PasswordSalt, u.PasswordHash))
+        {
+            var c = _fails.TryGetValue(key, out var old) ? old.count + 1 : 1;
+            _fails[key] = c >= 5 ? (c, DateTime.UtcNow.AddMinutes(2)) : (c, DateTime.MinValue);
+            using var cn = EngineDb.Open(); using var tx = cn.BeginTransaction(); EngineDb.InsertAudit(cn, tx, u?.Id ?? 1, "login.fail", "User", u?.Id ?? 0, "{}"); tx.Commit();
+            MessageBox.Show("Неверный логин/пароль");
+            return;
+        }
+
+        using (var cn = EngineDb.Open()) { using var tx = cn.BeginTransaction(); EngineDb.InsertAudit(cn, tx, u.Id, "login.success", "User", u.Id, "{}"); tx.Commit(); }
+        Hide();
+        using var shell = new MainShellForm(new SessionUser { Id = u.Id, Login = u.Login, DisplayName = u.DisplayName, Role = u.Role });
+        shell.ShowDialog();
+        Show();
     }
 }
 
-public sealed class MainForm : Form
+public sealed class MainShellForm : Form
 {
-    private readonly User _current;
-    private readonly TabControl _tabs = new() { Dock = DockStyle.Fill };
+    private readonly SessionUser _me;
+    private readonly Panel _work = new() { Dock = DockStyle.Fill, BackColor = Color.White };
+    private readonly ListBox _menu = new() { Dock = DockStyle.Fill };
+    private readonly StatusStrip _status = new();
+    private readonly ToolStripStatusLabel _statusLabel = new("Ready");
 
-    public MainForm(User user)
+    public MainShellForm(SessionUser me)
     {
-        _current = user;
-        Text = $"Платформа тестирования - {user.Name} ({user.Role})";
-        Width = 1200; Height = 780;
-        Controls.Add(_tabs);
-        BuildTabs();
+        _me = me;
+        Theme.Apply(this);
+        WindowState = FormWindowState.Maximized;
+        Text = "Платформа тестирования";
+
+        var header = new Panel { Dock = DockStyle.Top, Height = 60, Padding = new Padding(12), BackColor = Theme.Panel };
+        header.Controls.Add(new Label { Text = $"{me.DisplayName} ({me.Role})", Dock = DockStyle.Left, AutoSize = true, Font = Theme.HeaderFont });
+        var logout = Theme.Btn("Выйти", (_, _) => Close()); logout.Dock = DockStyle.Right; header.Controls.Add(logout);
+        var pass = Theme.Btn("Сменить пароль", (_, _) => ChangePassword()); pass.Dock = DockStyle.Right; header.Controls.Add(pass);
+
+        var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 240, FixedPanel = FixedPanel.Panel1 };
+        split.Panel1.BackColor = Theme.Panel; split.Panel1.Padding = new Padding(8);
+        split.Panel1.Controls.Add(_menu);
+        split.Panel2.Padding = new Padding(12);
+        split.Panel2.Controls.Add(_work);
+
+        _status.Items.Add(_statusLabel);
+        Controls.Add(split); Controls.Add(header); Controls.Add(_status);
+
+        LoadMenu();
+        _menu.SelectedIndexChanged += (_, _) => Render();
+        if (_menu.Items.Count > 0) _menu.SelectedIndex = 0;
     }
 
-    private void BuildTabs()
+    private void LoadMenu()
     {
-        if (_current.Role == UserRole.Admin) BuildAdminTabs();
-        if (_current.Role == UserRole.Teacher) BuildTeacherTabs();
-        if (_current.Role == UserRole.Student) BuildStudentTabs();
+        if (_me.Role == UserRole.Admin) _menu.Items.AddRange(new object[] { "Users", "Groups", "AuditLog" });
+        if (_me.Role == UserRole.Teacher) _menu.Items.AddRange(new object[] { "Tests", "Assignments", "Results", "Analytics" });
+        if (_me.Role == UserRole.Student) _menu.Items.AddRange(new object[] { "Available Tests", "My Attempts" });
     }
 
-    private void BuildAdminTabs()
+    private void SetStatus(string text) => _statusLabel.Text = text;
+
+    private void Render()
     {
-        var usersTab = new TabPage("Users");
-        var usersGrid = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true, AutoGenerateColumns = true };
-        var usersTop = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40 };
-        var name = new TextBox { Width = 140 }; var role = new ComboBox { Width = 120, DropDownStyle = ComboBoxStyle.DropDownList };
-        role.DataSource = Enum.GetValues<UserRole>();
-        var add = new Button { Text = "Add" }; var del = new Button { Text = "Delete selected" };
-        usersTop.Controls.AddRange(new Control[] { new Label { Text = "Name" }, name, new Label { Text = "Role" }, role, add, del });
-        usersTab.Controls.Add(usersGrid); usersTab.Controls.Add(usersTop);
-        void ReloadUsers() => usersGrid.DataSource = EngineDb.GetUsers();
-        ReloadUsers();
-        add.Click += (_, _) => { if (!string.IsNullOrWhiteSpace(name.Text)) { EngineDb.AddUser(name.Text.Trim(), (UserRole)role.SelectedItem!, _current.Id); name.Clear(); ReloadUsers(); } };
-        del.Click += (_, _) => { if (usersGrid.CurrentRow?.DataBoundItem is User u && u.Id != _current.Id) { EngineDb.DeleteUser(u.Id, _current.Id); ReloadUsers(); } };
-
-        var groupsTab = new TabPage("Groups");
-        var groupsGrid = new DataGridView { Dock = DockStyle.Left, Width = 350, ReadOnly = true, AutoGenerateColumns = true };
-        var membersGrid = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true, AutoGenerateColumns = true };
-        var grpTop = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40 };
-        var gname = new TextBox { Width = 150 }; var gadd = new Button { Text = "Create group" };
-        var memberCmb = new ComboBox { Width = 140, DropDownStyle = ComboBoxStyle.DropDownList }; var addM = new Button { Text = "Add member" }; var remM = new Button { Text = "Remove selected" };
-        grpTop.Controls.AddRange(new Control[] { gname, gadd, memberCmb, addM, remM });
-        groupsTab.Controls.Add(membersGrid); groupsTab.Controls.Add(groupsGrid); groupsTab.Controls.Add(grpTop);
-        void ReloadGroups() { groupsGrid.DataSource = EngineDb.GetGroups(); memberCmb.DataSource = EngineDb.GetUsers().Where(u => u.Role == UserRole.Student).ToList(); memberCmb.DisplayMember = "Name"; }
-        void ReloadMembers()
-        {
-            if (groupsGrid.CurrentRow?.DataBoundItem is not Group g) return;
-            var ids = EngineDb.GetGroupIdsForUser(0); // noop placeholder to keep methods centralized
-            using var c = EngineDb.Open();
-            using var cmd = c.CreateCommand();
-            cmd.CommandText = "SELECT u.Id,u.Name,u.Role FROM Users u JOIN GroupMembers gm ON gm.UserId=u.Id WHERE gm.GroupId=@g ORDER BY u.Name;";
-            cmd.Parameters.AddWithValue("@g", g.Id);
-            using var r = cmd.ExecuteReader();
-            var list = new List<User>();
-            while (r.Read()) list.Add(new User { Id = r.GetInt64(0), Name = r.GetString(1), Role = Enum.Parse<UserRole>(r.GetString(2)) });
-            membersGrid.DataSource = list;
-        }
-        ReloadGroups(); groupsGrid.SelectionChanged += (_, _) => ReloadMembers();
-        gadd.Click += (_, _) => { if (!string.IsNullOrWhiteSpace(gname.Text)) { EngineDb.AddGroup(gname.Text.Trim(), _current.Id); gname.Clear(); ReloadGroups(); } };
-        addM.Click += (_, _) => { if (groupsGrid.CurrentRow?.DataBoundItem is Group g && memberCmb.SelectedItem is User u) { EngineDb.SetGroupMember(g.Id, u.Id, true, _current.Id); ReloadMembers(); } };
-        remM.Click += (_, _) => { if (groupsGrid.CurrentRow?.DataBoundItem is Group g && membersGrid.CurrentRow?.DataBoundItem is User u) { EngineDb.SetGroupMember(g.Id, u.Id, false, _current.Id); ReloadMembers(); } };
-
-        var auditTab = new TabPage("AuditLog");
-        var auditGrid = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true, AutoGenerateColumns = true };
-        var auditRefresh = new Button { Text = "Refresh", Dock = DockStyle.Top };
-        auditTab.Controls.Add(auditGrid); auditTab.Controls.Add(auditRefresh);
-        void ReloadAudit() => auditGrid.DataSource = EngineDb.GetAuditLast(200);
-        ReloadAudit(); auditRefresh.Click += (_, _) => ReloadAudit();
-
-        _tabs.TabPages.Add(usersTab); _tabs.TabPages.Add(groupsTab); _tabs.TabPages.Add(auditTab);
+        _work.Controls.Clear();
+        if (_menu.SelectedItem == null) return;
+        var item = _menu.SelectedItem.ToString()!;
+        if (item == "Users") BuildAdminUsers();
+        else if (item == "Groups") BuildAdminGroups();
+        else if (item == "AuditLog") BuildAudit();
+        else if (item == "Tests") BuildTeacherTests();
+        else if (item == "Assignments") BuildAssignments();
+        else if (item == "Results") BuildResults();
+        else if (item == "Analytics") BuildAnalytics();
+        else if (item == "Available Tests") BuildAvailable();
+        else if (item == "My Attempts") BuildMyAttempts();
     }
 
-    private void BuildTeacherTabs()
+    private void BuildAdminUsers()
     {
-        var testsTab = new TabPage("Tests");
-        var testsGrid = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true, AutoGenerateColumns = true };
-        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40 };
-        var title = new TextBox { Width = 150 }; var pass = new NumericUpDown { Width = 70, Minimum = 1, Maximum = 100, Value = 60 };
-        var add = new Button { Text = "Create" }; var pub = new Button { Text = "Publish" }; var arch = new Button { Text = "Archive" }; var toDraft = new Button { Text = "Move to Draft" }; var clone = new Button { Text = "Clone" };
-        top.Controls.AddRange(new Control[] { title, pass, add, pub, arch, toDraft, clone });
-        testsTab.Controls.Add(testsGrid); testsTab.Controls.Add(top);
-        void ReloadTests() => testsGrid.DataSource = EngineDb.GetTestsByTeacher(_current.Id);
-        ReloadTests();
-        add.Click += (_, _) => { if (!string.IsNullOrWhiteSpace(title.Text)) { EngineDb.AddTest(new TestEntity { Title = title.Text.Trim(), CreatedByTeacherId = _current.Id, Status = TestStatus.Draft, PassPercent = (int)pass.Value }, _current.Id); title.Clear(); ReloadTests(); } };
-        pub.Click += (_, _) => { if (testsGrid.CurrentRow?.DataBoundItem is TestEntity t) { EngineDb.UpdateTestStatus(t.Id, TestStatus.Published, _current.Id); ReloadTests(); } };
-        arch.Click += (_, _) => { if (testsGrid.CurrentRow?.DataBoundItem is TestEntity t) { EngineDb.UpdateTestStatus(t.Id, TestStatus.Archived, _current.Id); ReloadTests(); } };
-        toDraft.Click += (_, _) => { if (testsGrid.CurrentRow?.DataBoundItem is TestEntity t) { EngineDb.UpdateTestStatus(t.Id, TestStatus.Draft, _current.Id); ReloadTests(); } };
-        clone.Click += (_, _) => { if (testsGrid.CurrentRow?.DataBoundItem is TestEntity t) { EngineDb.CloneTestToDraft(t.Id, _current.Id); ReloadTests(); } };
-
-        var questionsTab = new TabPage("Questions editor");
-        var split = new SplitContainer { Dock = DockStyle.Fill };
-        var tGrid = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true, AutoGenerateColumns = true };
-        var qGrid = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true, AutoGenerateColumns = true };
-        split.Panel1.Controls.Add(tGrid); split.Panel2.Controls.Add(qGrid);
-        var qTop = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40 };
-        var qText = new TextBox { Width = 230 }; var qType = new ComboBox { Width = 130, DropDownStyle = ComboBoxStyle.DropDownList }; qType.DataSource = Enum.GetValues<QuestionType>();
-        var qPts = new NumericUpDown { Width = 70, DecimalPlaces = 2, Minimum = 0, Maximum = 100, Value = 1 };
-        var optText = new TextBox { Width = 150 }; var optCorr = new CheckBox { Text = "Correct" }; var addQ = new Button { Text = "Add question" };
-        qTop.Controls.AddRange(new Control[] { qText, qType, qPts, new Label { Text = "Option" }, optText, optCorr, addQ });
-        questionsTab.Controls.Add(split); questionsTab.Controls.Add(qTop);
-        void ReloadTQ() => tGrid.DataSource = EngineDb.GetTestsByTeacher(_current.Id);
-        void ReloadQ() { if (tGrid.CurrentRow?.DataBoundItem is TestEntity t) qGrid.DataSource = EngineDb.GetQuestions(t.Id); }
-        ReloadTQ(); tGrid.SelectionChanged += (_, _) => ReloadQ();
-        addQ.Click += (_, _) =>
-        {
-            if (tGrid.CurrentRow?.DataBoundItem is not TestEntity t || string.IsNullOrWhiteSpace(qText.Text)) return;
-            var qt = (QuestionType)qType.SelectedItem!;
-            var q = new QuestionEntity { TestId = t.Id, Type = qt, Text = qText.Text.Trim(), Points = (double)qPts.Value, SettingsJson = "{}" };
-            var opts = new List<OptionEntity>();
-            if (qt == QuestionType.Text)
-                q.SettingsJson = JsonUtil.Serialize(new TextSettings { Accepted = new() { "demo" }, AllowManualCheck = true, CaseInsensitive = true, Trim = true });
-            if (qt == QuestionType.Numeric)
-                q.SettingsJson = JsonUtil.Serialize(new NumericSettings { Correct = 1, Tolerance = 0.01 });
-            if ((qt == QuestionType.SingleChoice || qt == QuestionType.MultipleChoice) && !string.IsNullOrWhiteSpace(optText.Text))
-                opts.Add(new OptionEntity { Text = optText.Text.Trim(), IsCorrect = optCorr.Checked, SortOrder = 1 });
-            EngineDb.AddQuestionWithOptions(q, opts, _current.Id);
-            qText.Clear(); optText.Clear(); optCorr.Checked = false; ReloadQ();
-        };
-
-        var assignTab = new TabPage("Assignments");
-        var aSplit = new SplitContainer { Dock = DockStyle.Fill };
-        var atestGrid = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true, AutoGenerateColumns = true };
-        var assGrid = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true, AutoGenerateColumns = true };
-        aSplit.Panel1.Controls.Add(atestGrid); aSplit.Panel2.Controls.Add(assGrid);
-        var aTop = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 46 };
-        var targetType = new ComboBox { Width = 90, DropDownStyle = ComboBoxStyle.DropDownList }; targetType.DataSource = Enum.GetValues<AssignmentTargetType>();
-        var target = new ComboBox { Width = 150, DropDownStyle = ComboBoxStyle.DropDownList };
-        var limit = new NumericUpDown { Width = 60, Minimum = 1, Maximum = 10, Value = 1 };
-        var minutes = new NumericUpDown { Width = 70, Minimum = 0, Maximum = 600, Value = 30 };
-        var deadline = new DateTimePicker { Width = 170, Format = DateTimePickerFormat.Custom, CustomFormat = "yyyy-MM-dd HH:mm" };
-        var shQ = new CheckBox { Text = "Shuffle Q", Checked = true }; var shO = new CheckBox { Text = "Shuffle O", Checked = true };
-        var ss = new CheckBox { Text = "ShowScore", Checked = true }; var sc = new CheckBox { Text = "ShowCorrect" };
-        var addA = new Button { Text = "Assign" };
-        aTop.Controls.AddRange(new Control[] { targetType, target, limit, minutes, deadline, shQ, shO, ss, sc, addA });
-        assignTab.Controls.Add(aSplit); assignTab.Controls.Add(aTop);
-        void ReloadAT() => atestGrid.DataSource = EngineDb.GetTestsByTeacher(_current.Id);
-        void ReloadAss() { if (atestGrid.CurrentRow?.DataBoundItem is TestEntity t) assGrid.DataSource = EngineDb.GetAssignmentsByTest(t.Id); }
-        void ReloadTarget()
-        {
-            if ((AssignmentTargetType)targetType.SelectedItem! == AssignmentTargetType.Group) { target.DataSource = EngineDb.GetGroups(); target.DisplayMember = "Name"; }
-            else { target.DataSource = EngineDb.GetUsers().Where(u => u.Role == UserRole.Student).ToList(); target.DisplayMember = "Name"; }
-        }
-        ReloadAT(); ReloadTarget(); atestGrid.SelectionChanged += (_, _) => ReloadAss(); targetType.SelectedIndexChanged += (_, _) => ReloadTarget();
-        addA.Click += (_, _) =>
-        {
-            if (atestGrid.CurrentRow?.DataBoundItem is not TestEntity t || target.SelectedItem == null) return;
-            var tid = target.SelectedItem is Group g ? g.Id : ((User)target.SelectedItem).Id;
-            var a = new Assignment { TestId = t.Id, TargetType = (AssignmentTargetType)targetType.SelectedItem!, TargetId = tid, AvailableFrom = Clock.ToDb(Clock.UtcNow()), Deadline = Clock.ToDb(deadline.Value.ToUniversalTime()), AttemptLimit = (int)limit.Value, TimeLimitMinutes = (int)minutes.Value <= 0 ? null : (int)minutes.Value, ShuffleQuestions = shQ.Checked, ShuffleOptions = shO.Checked, ShowScoreAfter = ss.Checked, ShowCorrectAfter = sc.Checked, IsActive = true };
-            EngineDb.AddAssignment(a, _current.Id); ReloadAss();
-        };
-
-        var resultsTab = new TabPage("Results");
-        var rSplit = new SplitContainer { Dock = DockStyle.Fill };
-        var rTestGrid = new DataGridView { Dock = DockStyle.Left, Width = 320, ReadOnly = true, AutoGenerateColumns = true };
-        var rAttempts = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true, AutoGenerateColumns = true };
-        var rTop = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40 };
-        var review = new Button { Text = "Open attempt" }; var export = new Button { Text = "Export CSV" };
-        rTop.Controls.AddRange(new Control[] { review, export });
-        rSplit.Panel1.Controls.Add(rTestGrid); rSplit.Panel2.Controls.Add(rAttempts);
-        resultsTab.Controls.Add(rSplit); resultsTab.Controls.Add(rTop);
-        void ReloadRT() => rTestGrid.DataSource = EngineDb.GetTestsByTeacher(_current.Id);
-        void ReloadRA()
-        {
-            if (rTestGrid.CurrentRow?.DataBoundItem is not TestEntity t) return;
-            var list = EngineDb.GetAttemptsByTest(t.Id).Select(a =>
-            {
-                var rs = EngineDb.GetAttemptResult(a.Id);
-                var pending = rs != null && JsonUtil.Deserialize<GradeDetails>(rs.DetailsJson).PendingManual;
-                return new { a.Id, Student = EngineDb.GetUser(a.UserId).Name, a.Status, PendingManual = pending, Score = rs?.Score, Percent = rs?.Percent, a.StartedAt, a.SubmittedAt };
-            }).ToList();
-            rAttempts.DataSource = list;
-        }
-        ReloadRT(); rTestGrid.SelectionChanged += (_, _) => ReloadRA();
-        review.Click += (_, _) =>
-        {
-            if (rAttempts.CurrentRow?.Cells["Id"].Value is not long aid) return;
-            using var f = new AttemptReviewForm(_current, aid);
-            f.ShowDialog();
-            ReloadRA();
-        };
-        export.Click += (_, _) =>
-        {
-            if (rTestGrid.CurrentRow?.DataBoundItem is not TestEntity t) return;
-            using var sfd = new SaveFileDialog { Filter = "CSV|*.csv", FileName = $"results_test_{t.Id}.csv" };
-            if (sfd.ShowDialog() == DialogResult.OK) { AttemptLogic.ExportResultsCsv(_current.Id, t.Id, sfd.FileName); MessageBox.Show("Exported"); }
-        };
-
-        var analyticsTab = new TabPage("Analytics");
-        var anTest = new ComboBox { Dock = DockStyle.Top, DropDownStyle = ComboBoxStyle.DropDownList };
-        var anBox = new TextBox { Dock = DockStyle.Fill, Multiline = true, ScrollBars = ScrollBars.Vertical, ReadOnly = true };
-        var anBtn = new Button { Dock = DockStyle.Top, Height = 36, Text = "Calculate" };
-        analyticsTab.Controls.Add(anBox); analyticsTab.Controls.Add(anBtn); analyticsTab.Controls.Add(anTest);
-        anTest.DataSource = EngineDb.GetTestsByTeacher(_current.Id); anTest.DisplayMember = "Title";
-        anBtn.Click += (_, _) =>
-        {
-            if (anTest.SelectedItem is not TestEntity t) return;
-            var a = AttemptLogic.GetAnalyticsForTeacher(_current.Id, t.Id);
-            anBox.Text = JsonUtil.Serialize(a);
-        };
-
-        _tabs.TabPages.Add(testsTab); _tabs.TabPages.Add(questionsTab); _tabs.TabPages.Add(assignTab); _tabs.TabPages.Add(resultsTab); _tabs.TabPages.Add(analyticsTab);
-    }
-
-    private void BuildStudentTabs()
-    {
-        var availTab = new TabPage("Available tests");
-        var g = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true, AutoGenerateColumns = true };
-        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40 };
-        var start = new Button { Text = "Начать" }; var refresh = new Button { Text = "Refresh" };
-        top.Controls.AddRange(new Control[] { start, refresh });
-        availTab.Controls.Add(g); availTab.Controls.Add(top);
-        void ReloadAvail() => g.DataSource = AttemptLogic.ListAvailableAssignments(_current.Id);
-        ReloadAvail(); refresh.Click += (_, _) => ReloadAvail();
-        start.Click += (_, _) =>
-        {
-            if (g.CurrentRow?.DataBoundItem is not AvailableAssignmentView a) return;
-            var id = AttemptLogic.StartAttempt(_current.Id, a.AssignmentId);
-            using var form = new AttemptForm(_current, id);
-            form.ShowDialog();
-            ReloadAvail();
-        };
-
-        var myTab = new TabPage("My attempts");
-        var mg = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true, AutoGenerateColumns = true };
-        var mtop = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 40 };
-        var mref = new Button { Text = "Refresh" }; var mopen = new Button { Text = "Open" };
-        mtop.Controls.AddRange(new Control[] { mref, mopen });
-        myTab.Controls.Add(mg); myTab.Controls.Add(mtop);
-        void ReloadMy()
-        {
-            var list = new List<object>();
-            foreach (var a in AttemptLogic.ListAvailableAssignments(_current.Id))
-                foreach (var at in EngineDb.GetAttemptsByAssignmentAndUser(a.AssignmentId, _current.Id))
-                {
-                    var res = EngineDb.GetAttemptResult(at.Id);
-                    var pending = res != null && JsonUtil.Deserialize<GradeDetails>(res.DetailsJson).PendingManual;
-                    list.Add(new { at.Id, a.TestTitle, at.Status, PendingManual = pending, Score = res?.Score, Percent = res?.Percent, at.StartedAt, at.SubmittedAt });
-                }
-            mg.DataSource = list.OrderByDescending(x => ((dynamic)x).Id).ToList();
-        }
-        ReloadMy(); mref.Click += (_, _) => ReloadMy();
-        mopen.Click += (_, _) =>
-        {
-            if (mg.CurrentRow?.Cells["Id"].Value is not long id) return;
-            var at = EngineDb.GetAttempt(id);
-            if (at.Status == AttemptStatus.Active)
-            {
-                using var form = new AttemptForm(_current, id);
-                form.ShowDialog();
-            }
-            else
-            {
-                var review = AttemptLogic.GetAttemptReview(_current.Id, id);
-                MessageBox.Show(JsonUtil.Serialize(review));
-            }
-            ReloadMy();
-        };
-
-        _tabs.TabPages.Add(availTab); _tabs.TabPages.Add(myTab);
-    }
-}
-
-public sealed class AttemptReviewForm : Form
-{
-    public AttemptReviewForm(User teacher, long attemptId)
-    {
-        Text = $"Attempt #{attemptId}"; Width = 900; Height = 650;
-        var box = new TextBox { Dock = DockStyle.Fill, Multiline = true, ScrollBars = ScrollBars.Both, ReadOnly = true, Font = new Font("Consolas", 10) };
-        var btn = new Button { Dock = DockStyle.Top, Height = 36, Text = "Apply manual score to selected Text question" };
-        Controls.Add(box); Controls.Add(btn);
-        void Reload() => box.Text = JsonUtil.Serialize(AttemptLogic.GetAttemptReview(teacher.Id, attemptId));
+        var g = Theme.Grid();
+        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 46, Padding = new Padding(4) };
+        var login = new TextBox { Width = 120 }; var name = new TextBox { Width = 150 }; var role = new ComboBox { Width = 120, DropDownStyle = ComboBoxStyle.DropDownList }; role.DataSource = Enum.GetValues<UserRole>();
+        top.Controls.AddRange(new Control[] { new Label { Text = "Login" }, login, new Label { Text = "Name" }, name, role,
+            Theme.Btn("Add", (_,_)=>{ if(string.IsNullOrWhiteSpace(login.Text)||string.IsNullOrWhiteSpace(name.Text)){MessageBox.Show("Введите данные");return;} using var d=new PasswordInputDialog("Пароль"); if(d.ShowDialog()!=DialogResult.OK)return; EngineDb.AddUser(login.Text.Trim(),name.Text.Trim(),(UserRole)role.SelectedItem!,d.Value,_me.Id); Reload(); SetStatus("Сохранено");}),
+            Theme.Btn("Edit",(_,_)=>{ if(g.CurrentRow?.DataBoundItem is not User u)return; var nm=Microsoft.VisualBasic.Interaction.InputBox("DisplayName","Edit",u.DisplayName); if(string.IsNullOrWhiteSpace(nm))return; EngineDb.UpdateUser(u.Id,nm,u.Role,u.IsActive,_me.Id); Reload();}),
+            Theme.Btn("Reset Password",(_,_)=>{ if(g.CurrentRow?.DataBoundItem is not User u)return; using var d=new PasswordInputDialog("Новый пароль"); if(d.ShowDialog()!=DialogResult.OK)return; EngineDb.SetPassword(u.Id,d.Value,_me.Id); SetStatus("Пароль обновлён");}),
+            Theme.Btn("Enable/Disable",(_,_)=>{ if(g.CurrentRow?.DataBoundItem is not User u)return; EngineDb.UpdateUser(u.Id,u.DisplayName,u.Role,!u.IsActive,_me.Id); Reload();}),
+            Theme.Btn("Delete",(_,_)=>{ if(g.CurrentRow?.DataBoundItem is not User u)return; EngineDb.SoftDeleteUser(u.Id,_me.Id); Reload(); }) });
+        _work.Controls.Add(g); _work.Controls.Add(top);
+        void Reload() => g.DataSource = EngineDb.GetUsers().Select(u => new { u.Id, u.Login, u.DisplayName, u.Role, Active = u.IsActive }).ToList();
         Reload();
-        btn.Click += (_, _) =>
+    }
+
+    private void BuildAdminGroups()
+    {
+        var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 320 };
+        var gl = Theme.Grid(); var st = Theme.Grid();
+        var leftTop = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 42 };
+        var gname = new TextBox { Width = 150 };
+        leftTop.Controls.AddRange(new Control[] { gname, Theme.Btn("Create", (_, _) => { if (string.IsNullOrWhiteSpace(gname.Text)) return; EngineDb.AddGroup(gname.Text.Trim(), _me.Id); gname.Clear(); ReloadGroups(); }), Theme.Btn("Rename", (_, _) => { if (gl.CurrentRow?.DataBoundItem is not Group g) return; var n = Microsoft.VisualBasic.Interaction.InputBox("Name", "Rename", g.Name); if (!string.IsNullOrWhiteSpace(n)) { EngineDb.RenameGroup(g.Id, n, _me.Id); ReloadGroups(); } }), Theme.Btn("Delete", (_, _) => { if (gl.CurrentRow?.DataBoundItem is Group g) { EngineDb.DeleteGroup(g.Id, _me.Id); ReloadGroups(); } }) });
+        split.Panel1.Controls.Add(gl); split.Panel1.Controls.Add(leftTop);
+
+        var rt = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 42 };
+        var filter = new TextBox { Width = 140 }; var cmb = new ComboBox { Width = 200, DropDownStyle = ComboBoxStyle.DropDownList };
+        rt.Controls.AddRange(new Control[] { new Label { Text = "Filter" }, filter, cmb, Theme.Btn("Add", (_, _) => { if (gl.CurrentRow?.DataBoundItem is not Group g || cmb.SelectedItem is not User u) return; EngineDb.SetGroupMember(g.Id, u.Id, true, _me.Id); ReloadMembers(); }), Theme.Btn("Remove", (_, _) => { if (gl.CurrentRow?.DataBoundItem is not Group g || st.CurrentRow?.DataBoundItem is not User u) return; EngineDb.SetGroupMember(g.Id, u.Id, false, _me.Id); ReloadMembers(); }) });
+        split.Panel2.Controls.Add(st); split.Panel2.Controls.Add(rt);
+        _work.Controls.Add(split);
+
+        void ReloadGroups() { gl.DataSource = EngineDb.GetGroups(); LoadStudents(); }
+        void LoadStudents() { var q = EngineDb.GetUsers().Where(x => x.Role == UserRole.Student && x.IsActive); if (!string.IsNullOrWhiteSpace(filter.Text)) q = q.Where(x => x.DisplayName.Contains(filter.Text, StringComparison.OrdinalIgnoreCase) || x.Login.Contains(filter.Text, StringComparison.OrdinalIgnoreCase)); cmb.DataSource = q.ToList(); cmb.DisplayMember = "DisplayName"; }
+        void ReloadMembers() { if (gl.CurrentRow?.DataBoundItem is Group g) st.DataSource = EngineDb.GetGroupStudents(g.Id); }
+        gl.SelectionChanged += (_, _) => ReloadMembers(); filter.TextChanged += (_, _) => LoadStudents();
+        ReloadGroups();
+    }
+
+    private void BuildAudit()
+    {
+        var g = Theme.Grid();
+        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 42 };
+        var actor = new TextBox { Width = 110 }; var action = new TextBox { Width = 120 }; var from = new DateTimePicker { Width = 150 }; var to = new DateTimePicker { Width = 150 };
+        top.Controls.AddRange(new Control[] { new Label { Text = "Actor" }, actor, new Label { Text = "Action" }, action, from, to, Theme.Btn("Refresh", (_, _) => g.DataSource = EngineDb.GetAudit(actor.Text, action.Text, from.Value.Date, to.Value.Date.AddDays(1).AddSeconds(-1))) });
+        _work.Controls.Add(g); _work.Controls.Add(top);
+        g.DataSource = EngineDb.GetAudit();
+    }
+
+    private void BuildTeacherTests()
+    {
+        var g = Theme.Grid();
+        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 46 };
+        var title = new TextBox { Width = 180 };
+        top.Controls.AddRange(new Control[] { title,
+            Theme.Btn("Create",(_,_)=>{ if(string.IsNullOrWhiteSpace(title.Text))return; var id=EngineDb.AddTest(new TestEntity{Title=title.Text,Description="",CreatedByTeacherId=_me.Id,Status=TestStatus.Draft},_me.Id); Reload(); SetStatus($"Test #{id} created"); }, true),
+            Theme.Btn("Open in Constructor",(_,_)=>{ if(g.CurrentRow?.DataBoundItem is not TestEntity t)return; using var f=new ConstructorForm(_me,t.Id); f.ShowDialog(); Reload();}),
+            Theme.Btn("Publish",(_,_)=>{ if(g.CurrentRow?.DataBoundItem is TestEntity t){ EngineDb.UpdateTestStatus(t.Id,TestStatus.Published,_me.Id); Reload();}}),
+            Theme.Btn("Archive",(_,_)=>{ if(g.CurrentRow?.DataBoundItem is TestEntity t){ EngineDb.UpdateTestStatus(t.Id,TestStatus.Archived,_me.Id); Reload();}}),
+            Theme.Btn("Clone",(_,_)=>{ if(g.CurrentRow?.DataBoundItem is TestEntity t){ EngineDb.CloneTest(t.Id,_me.Id); Reload();}})
+        });
+        _work.Controls.Add(g); _work.Controls.Add(top);
+        void Reload() => g.DataSource = EngineDb.GetTestsByTeacher(_me.Id);
+        Reload();
+    }
+
+    private void BuildAssignments()
+    {
+        var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 340 };
+        var tg = Theme.Grid(); var ag = Theme.Grid();
+        split.Panel1.Controls.Add(tg); split.Panel2.Controls.Add(ag);
+        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 50 };
+        var tt = new ComboBox { Width = 100, DropDownStyle = ComboBoxStyle.DropDownList }; tt.DataSource = Enum.GetValues<TargetType>();
+        var target = new ComboBox { Width = 180, DropDownStyle = ComboBoxStyle.DropDownList };
+        var al = new NumericUpDown { Width = 60, Minimum = 1, Maximum = 10, Value = 1 };
+        var tm = new NumericUpDown { Width = 70, Minimum = 0, Maximum = 600, Value = 30 };
+        var dl = new DateTimePicker { Width = 170, Format = DateTimePickerFormat.Custom, CustomFormat = "yyyy-MM-dd HH:mm" };
+        var sq = new CheckBox { Text = "ShuffleQ", Checked = true }; var so = new CheckBox { Text = "ShuffleO", Checked = true }; var ss = new CheckBox { Text = "ScoreAfter", Checked = true }; var sc = new CheckBox { Text = "CorrectAfter" };
+        top.Controls.AddRange(new Control[] { tt, target, al, tm, dl, sq, so, ss, sc, Theme.Btn("Assign", (_, _) => { if (tg.CurrentRow?.DataBoundItem is not TestEntity t || target.SelectedItem == null) return; var tid = target.SelectedItem is Group g ? g.Id : ((User)target.SelectedItem).Id; EngineDb.AddAssignment(new Assignment { TestId = t.Id, TargetType = (TargetType)tt.SelectedItem!, TargetId = tid, AvailableFrom = TimeUtil.Iso(TimeUtil.UtcNow), Deadline = TimeUtil.Iso(dl.Value.ToUniversalTime()), AttemptLimit = (int)al.Value, TimeLimitMinutes = (int)tm.Value == 0 ? null : (int)tm.Value, ShuffleQuestions = sq.Checked, ShuffleOptions = so.Checked, ShowScoreAfter = ss.Checked, ShowCorrectAfter = sc.Checked, IsActive = true }, _me.Id); ReloadA(); }, true), Theme.Btn("Activate/Deactivate", (_, _) => { if (ag.CurrentRow?.DataBoundItem is not Assignment a) return; EngineDb.SetAssignmentActive(a.Id, !a.IsActive, _me.Id); ReloadA(); }) });
+        _work.Controls.Add(split); _work.Controls.Add(top);
+        void LoadTarget() { if ((TargetType)tt.SelectedItem! == TargetType.Group) { target.DataSource = EngineDb.GetGroups(); target.DisplayMember = "Name"; } else { target.DataSource = EngineDb.GetUsers().Where(x => x.Role == UserRole.Student && x.IsActive).ToList(); target.DisplayMember = "DisplayName"; } }
+        void ReloadA() { if (tg.CurrentRow?.DataBoundItem is TestEntity t) ag.DataSource = EngineDb.GetAssignmentsByTest(t.Id); }
+        tg.DataSource = EngineDb.GetTestsByTeacher(_me.Id);
+        tt.SelectedIndexChanged += (_, _) => LoadTarget(); tg.SelectionChanged += (_, _) => ReloadA(); LoadTarget();
+    }
+
+    private void BuildResults()
+    {
+        var split = new SplitContainer { Dock = DockStyle.Fill, SplitterDistance = 320 };
+        var tg = Theme.Grid(); var ag = Theme.Grid();
+        tg.DataSource = EngineDb.GetTestsByTeacher(_me.Id);
+        split.Panel1.Controls.Add(tg); split.Panel2.Controls.Add(ag);
+        var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 46 };
+        top.Controls.AddRange(new Control[] { Theme.Btn("Open Attempt", (_, _) => { if (ag.CurrentRow?.Cells["Id"].Value is not long id) return; MessageBox.Show(JsonUtil.To(AttemptLogic.GetReview(_me, id))); }), Theme.Btn("Export CSV", (_, _) => { if (tg.CurrentRow?.DataBoundItem is not TestEntity t) return; using var sfd = new SaveFileDialog { Filter = "CSV|*.csv", FileName = $"results_{t.Id}.csv" }; if (sfd.ShowDialog() == DialogResult.OK) { AttemptLogic.ExportCsv(_me.Id, t.Id, sfd.FileName); SetStatus("Exported"); } }) });
+        _work.Controls.Add(split); _work.Controls.Add(top);
+        tg.SelectionChanged += (_, _) => { if (tg.CurrentRow?.DataBoundItem is not TestEntity t) return; ag.DataSource = EngineDb.GetAttemptsByTest(t.Id).Select(a => new { a.Id, Student = EngineDb.GetUsers().First(x => x.Id == a.UserId).DisplayName, a.Status, Result = EngineDb.GetResult(a.Id)?.Score, a.StartedAt, a.SubmittedAt }).ToList(); };
+        if (tg.Rows.Count > 0) tg.Rows[0].Selected = true;
+    }
+
+    private void BuildAnalytics()
+    {
+        var cmb = new ComboBox { Dock = DockStyle.Top, DropDownStyle = ComboBoxStyle.DropDownList };
+        cmb.DataSource = EngineDb.GetTestsByTeacher(_me.Id); cmb.DisplayMember = "Title";
+        var box = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both };
+        var btn = Theme.Btn("Calculate", (_, _) => { if (cmb.SelectedItem is not TestEntity t) return; box.Text = JsonUtil.To(AttemptLogic.Analytics(_me.Id, t.Id)); }, true); btn.Dock = DockStyle.Top;
+        _work.Controls.Add(box); _work.Controls.Add(btn); _work.Controls.Add(cmb);
+    }
+
+    private void BuildAvailable()
+    {
+        var g = Theme.Grid(); var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 46 };
+        top.Controls.Add(Theme.Btn("Start", (_, _) => { if (g.CurrentRow?.DataBoundItem is not AvailableAssignment a) return; var id = AttemptLogic.StartAttempt(_me.Id, a.AssignmentId); using var f = new AttemptPlayerForm(_me, id); f.ShowDialog(); Reload(); }, true));
+        top.Controls.Add(Theme.Btn("Refresh", (_, _) => Reload()));
+        _work.Controls.Add(g); _work.Controls.Add(top);
+        void Reload() => g.DataSource = AttemptLogic.ListAvailableAssignments(_me.Id);
+        Reload();
+    }
+
+    private void BuildMyAttempts()
+    {
+        var g = Theme.Grid(); var top = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 46 };
+        top.Controls.AddRange(new Control[] { Theme.Btn("Refresh", (_, _) => Reload()), Theme.Btn("Review", (_, _) => { if (g.CurrentRow?.Cells["Id"].Value is not long id) return; var a = EngineDb.GetAttempt(id); if (a.Status == AttemptStatus.Active) { using var f = new AttemptPlayerForm(_me, id); f.ShowDialog(); } else MessageBox.Show(JsonUtil.To(AttemptLogic.GetReview(_me, id))); Reload(); }) });
+        _work.Controls.Add(g); _work.Controls.Add(top);
+        void Reload()
         {
-            var a = EngineDb.GetAttempt(attemptId);
-            var snap = JsonUtil.Deserialize<AttemptSnapshot>(a.SnapshotJson);
-            var q = snap.Questions.FirstOrDefault(x => x.Type == QuestionType.Text);
-            if (q == null) { MessageBox.Show("No text questions"); return; }
-            var score = Microsoft.VisualBasic.Interaction.InputBox("Score", "Manual check", "0");
-            if (double.TryParse(score, out var s)) { AttemptLogic.ApplyManualCheck(attemptId, q.Id, teacher.Id, s, "manual by teacher"); Reload(); }
-        };
+            var rows = new List<object>();
+            foreach (var a in AttemptLogic.ListAvailableAssignments(_me.Id)) foreach (var at in EngineDb.GetAttemptsByAssignmentAndUser(a.AssignmentId, _me.Id)) { var r = EngineDb.GetResult(at.Id); rows.Add(new { at.Id, Test = a.TestTitle, at.Status, Score = r?.Score, Percent = r?.Percent, at.StartedAt, at.SubmittedAt }); }
+            g.DataSource = rows.OrderByDescending(x => ((dynamic)x).Id).ToList();
+        }
+        Reload();
+    }
+
+    private void ChangePassword()
+    {
+        using var d = new ChangePasswordForm(_me);
+        d.ShowDialog();
     }
 }
 
-public sealed class AttemptForm : Form
+public sealed class AttemptPlayerForm : Form
 {
-    private readonly User _student;
+    private readonly SessionUser _u;
     private readonly long _attemptId;
-    private readonly AttemptSnapshot _snapshot;
+    private readonly AttemptSnapshot _snap;
     private int _idx;
-    private readonly Label _timer = new() { Dock = DockStyle.Top, Height = 30, TextAlign = ContentAlignment.MiddleCenter };
-    private readonly ListBox _nav = new() { Dock = DockStyle.Left, Width = 170 };
-    private readonly Panel _panel = new() { Dock = DockStyle.Fill };
-    private readonly Button _save = new() { Text = "Сохранить" };
-    private readonly Button _prev = new() { Text = "Назад" };
-    private readonly Button _next = new() { Text = "Далее" };
-    private readonly Button _submit = new() { Text = "Отправить" };
+    private readonly Label _timer = new() { Dock = DockStyle.Top, Height = 32, Font = Theme.HeaderFont };
+    private readonly ListBox _nav = new() { Dock = DockStyle.Left, Width = 220 };
+    private readonly Panel _qPanel = new() { Dock = DockStyle.Fill, Padding = new Padding(10) };
     private readonly System.Windows.Forms.Timer _tick = new() { Interval = 1000 };
 
-    public AttemptForm(User student, long attemptId)
+    public AttemptPlayerForm(SessionUser u, long attemptId)
     {
-        _student = student; _attemptId = attemptId;
-        var attempt = EngineDb.GetAttempt(attemptId);
-        _snapshot = JsonUtil.Deserialize<AttemptSnapshot>(attempt.SnapshotJson);
-        Text = $"Attempt #{attemptId} - {_snapshot.TestTitle}"; Width = 900; Height = 650;
-        var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 44 };
-        bottom.Controls.AddRange(new Control[] { _prev, _next, _save, _submit });
-        Controls.Add(_panel); Controls.Add(_nav); Controls.Add(bottom); Controls.Add(_timer);
-
-        _nav.Items.AddRange(_snapshot.Questions.Select((q, i) => $"Q{i + 1}: {q.Type}").Cast<object>().ToArray());
+        _u = u; _attemptId = attemptId;
+        Theme.Apply(this); Text = "Прохождение теста";
+        var a = EngineDb.GetAttempt(attemptId); _snap = JsonUtil.From<AttemptSnapshot>(a.SnapshotJson);
+        var bottom = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 48 };
+        bottom.Controls.AddRange(new Control[] { Theme.Btn("Back", (_, _) => Move(-1)), Theme.Btn("Next", (_, _) => { SaveCurrent(); Move(1); }), Theme.Btn("Save", (_, _) => SaveCurrent()), Theme.Btn("Submit", (_, _) => { SaveCurrent(); AttemptLogic.SubmitAttempt(_attemptId, "manual"); Close(); }, true) });
+        Controls.Add(_qPanel); Controls.Add(_nav); Controls.Add(bottom); Controls.Add(_timer);
+        _nav.Items.AddRange(_snap.Questions.Select((x, i) => $"{i + 1}. {x.Type}").ToArray());
         _nav.SelectedIndexChanged += (_, _) => { if (_nav.SelectedIndex >= 0) { _idx = _nav.SelectedIndex; RenderQuestion(); } };
-        _prev.Click += (_, _) => { if (_idx > 0) { _idx--; _nav.SelectedIndex = _idx; } };
-        _next.Click += (_, _) => { if (_idx < _snapshot.Questions.Count - 1) { _idx++; _nav.SelectedIndex = _idx; } };
-        _save.Click += (_, _) => SaveCurrent();
-        _submit.Click += (_, _) => { SaveCurrent(); AttemptLogic.SubmitAttempt(_attemptId, "manual"); Close(); };
-        FormClosing += AttemptForm_FormClosing;
-
-        _tick.Tick += (_, _) => CheckTimer(); _tick.Start();
+        _tick.Tick += (_, _) => Tick(); _tick.Start();
+        FormClosing += OnClosing;
         _nav.SelectedIndex = 0;
     }
 
-    private void CheckTimer()
+    private void Tick()
     {
         var a = EngineDb.GetAttempt(_attemptId);
-        if (!string.IsNullOrWhiteSpace(a.EndsAt))
-        {
-            var left = Clock.FromDb(a.EndsAt!) - Clock.UtcNow();
-            _timer.Text = left <= TimeSpan.Zero ? "Time is over" : $"Осталось: {left:hh\\:mm\\:ss}";
-            if (left <= TimeSpan.Zero && a.Status == AttemptStatus.Active)
-            {
-                AttemptLogic.SubmitAttempt(_attemptId, "timeExpired");
-                MessageBox.Show("Время вышло. Попытка отправлена автоматически.");
-                Close();
-            }
-        }
-        else _timer.Text = "Без ограничения времени";
+        if (a.EndsAt == null) { _timer.Text = _snap.TestTitle; return; }
+        var left = TimeUtil.Parse(a.EndsAt) - TimeUtil.UtcNow;
+        _timer.Text = left <= TimeSpan.Zero ? "Время вышло" : $"{_snap.TestTitle} — осталось {left:hh\\:mm\\:ss}";
+        if (left <= TimeSpan.Zero && a.Status == AttemptStatus.Active) { AttemptLogic.SubmitAttempt(_attemptId, "timeExpired"); MessageBox.Show("Время вышло. Попытка отправлена."); Close(); }
     }
 
-    private void AttemptForm_FormClosing(object? sender, FormClosingEventArgs e)
+    private void OnClosing(object? s, FormClosingEventArgs e)
     {
         var a = EngineDb.GetAttempt(_attemptId);
         if (a.Status != AttemptStatus.Active) return;
-        var ans = MessageBox.Show("Сабмитнуть попытку перед выходом?", "Выход", MessageBoxButtons.YesNoCancel);
-        if (ans == DialogResult.Cancel) { e.Cancel = true; return; }
-        if (ans == DialogResult.Yes) { SaveCurrent(); AttemptLogic.SubmitAttempt(_attemptId, "manual"); }
+        var r = MessageBox.Show("Сдать попытку сейчас? (Нет — продолжить позже)", "Выход", MessageBoxButtons.YesNoCancel);
+        if (r == DialogResult.Cancel) e.Cancel = true;
+        if (r == DialogResult.Yes) { SaveCurrent(); AttemptLogic.SubmitAttempt(_attemptId, "manual"); }
     }
+
+    private void Move(int d) { var n = _idx + d; if (n < 0 || n >= _snap.Questions.Count) return; _nav.SelectedIndex = n; }
 
     private void RenderQuestion()
     {
-        _panel.Controls.Clear();
-        var q = _snapshot.Questions[_idx];
-        var label = new Label { Dock = DockStyle.Top, Height = 70, Text = q.Text };
-        _panel.Controls.Add(label);
-
-        switch (q.Type)
+        _qPanel.Controls.Clear();
+        var q = _snap.Questions[_idx];
+        _qPanel.Controls.Add(new Label { Text = q.Text, Dock = DockStyle.Top, Height = 60, Font = Theme.HeaderFont });
+        if (q.Type == QuestionType.SingleChoice)
         {
-            case QuestionType.SingleChoice:
-                var rg = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, AutoScroll = true, Tag = "single" };
-                foreach (var o in q.Options) rg.Controls.Add(new RadioButton { Text = o.Text, Tag = o.Id, AutoSize = true });
-                _panel.Controls.Add(rg);
-                break;
-            case QuestionType.MultipleChoice:
-                var cg = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, AutoScroll = true, Tag = "multi" };
-                foreach (var o in q.Options) cg.Controls.Add(new CheckBox { Text = o.Text, Tag = o.Id, AutoSize = true });
-                _panel.Controls.Add(cg);
-                break;
-            case QuestionType.Text:
-                _panel.Controls.Add(new TextBox { Dock = DockStyle.Fill, Multiline = true, Tag = "text" });
-                break;
-            case QuestionType.Numeric:
-                _panel.Controls.Add(new NumericUpDown { Dock = DockStyle.Top, DecimalPlaces = 4, Minimum = -100000, Maximum = 100000, Tag = "num" });
-                break;
+            var p = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, Tag = "single" };
+            foreach (var o in q.Options.Take(4)) p.Controls.Add(new RadioButton { Text = o.Text, Tag = o.Id, AutoSize = true });
+            _qPanel.Controls.Add(p);
         }
+        else if (q.Type == QuestionType.MultipleChoice)
+        {
+            var p = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, Tag = "multi" };
+            foreach (var o in q.Options) p.Controls.Add(new CheckBox { Text = o.Text, Tag = o.Id, AutoSize = true });
+            _qPanel.Controls.Add(p);
+        }
+        else if (q.Type == QuestionType.Text) _qPanel.Controls.Add(new TextBox { Dock = DockStyle.Fill, Multiline = true, Tag = "txt" });
+        else _qPanel.Controls.Add(new NumericUpDown { Dock = DockStyle.Top, DecimalPlaces = 4, Maximum = 100000, Minimum = -100000, Tag = "num" });
     }
 
     private void SaveCurrent()
     {
-        var q = _snapshot.Questions[_idx];
+        var q = _snap.Questions[_idx];
         string json = "{}";
-        if (_panel.Controls.OfType<FlowLayoutPanel>().FirstOrDefault() is FlowLayoutPanel p)
+        if (_qPanel.Controls.OfType<FlowLayoutPanel>().FirstOrDefault() is FlowLayoutPanel p)
         {
-            if ((string)p.Tag == "single")
-            {
-                var id = p.Controls.OfType<RadioButton>().FirstOrDefault(x => x.Checked)?.Tag as long? ?? 0;
-                json = JsonUtil.Serialize(new { selectedOptionId = id });
-            }
-            if ((string)p.Tag == "multi")
-            {
-                var ids = p.Controls.OfType<CheckBox>().Where(x => x.Checked).Select(x => (long)x.Tag).ToList();
-                json = JsonUtil.Serialize(new { selectedOptionIds = ids });
-            }
+            if ((string)p.Tag == "single") json = JsonUtil.To(new { selectedOptionId = p.Controls.OfType<RadioButton>().FirstOrDefault(x => x.Checked)?.Tag as long? ?? 0L });
+            if ((string)p.Tag == "multi") json = JsonUtil.To(new { selectedOptionIds = p.Controls.OfType<CheckBox>().Where(x => x.Checked).Select(x => (long)x.Tag).ToArray() });
         }
-        if (_panel.Controls.OfType<TextBox>().FirstOrDefault() is TextBox tb) json = JsonUtil.Serialize(new { text = tb.Text });
-        if (_panel.Controls.OfType<NumericUpDown>().FirstOrDefault() is NumericUpDown nu) json = JsonUtil.Serialize(new { value = (double)nu.Value });
+        if (_qPanel.Controls.OfType<TextBox>().FirstOrDefault() is TextBox tb) json = JsonUtil.To(new { text = tb.Text });
+        if (_qPanel.Controls.OfType<NumericUpDown>().FirstOrDefault() is NumericUpDown n) json = JsonUtil.To(new { value = (double)n.Value });
         AttemptLogic.SaveAnswer(_attemptId, q.Id, json);
+    }
+}
+
+public sealed class ChangePasswordForm : Form
+{
+    public ChangePasswordForm(SessionUser me)
+    {
+        Theme.Apply(this); Text = "Смена пароля"; Width = 420; Height = 280;
+        var old = new TextBox { PasswordChar = '•', Width = 220 }; var nw = new TextBox { PasswordChar = '•', Width = 220 }; var cf = new TextBox { PasswordChar = '•', Width = 220 };
+        var lay = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, Padding = new Padding(16), WrapContents = false };
+        lay.Controls.AddRange(new Control[] { new Label { Text = "Старый пароль" }, old, new Label { Text = "Новый пароль" }, nw, new Label { Text = "Подтверждение" }, cf,
+            Theme.Btn("Сохранить",(_,_)=>{
+                var u=EngineDb.GetUsers().First(x=>x.Id==me.Id);
+                if(!Security.Verify(old.Text,u.PasswordSalt,u.PasswordHash)){MessageBox.Show("Неверный старый пароль"); return;}
+                if(string.IsNullOrWhiteSpace(nw.Text)||nw.Text!=cf.Text){MessageBox.Show("Проверьте новый пароль"); return;}
+                EngineDb.SetPassword(me.Id,nw.Text,me.Id); MessageBox.Show("Пароль обновлён"); Close();
+            },true)
+        });
+        Controls.Add(lay);
+    }
+}
+
+public sealed class PasswordInputDialog : Form
+{
+    private readonly TextBox _tb = new() { PasswordChar = '•', Width = 220 };
+    public string Value => _tb.Text;
+    public PasswordInputDialog(string title)
+    {
+        Theme.Apply(this); Text = title; Width = 330; Height = 170;
+        var p = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, Padding = new Padding(12), WrapContents = false };
+        p.Controls.Add(_tb); p.Controls.Add(Theme.Btn("OK", (_, _) => { if (string.IsNullOrWhiteSpace(_tb.Text)) { MessageBox.Show("Пароль пустой"); return; } DialogResult = DialogResult.OK; }, true));
+        Controls.Add(p);
     }
 }
