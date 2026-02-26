@@ -27,13 +27,26 @@ public sealed class LoginForm : Form
     {
         Theme.Apply(this);
         Text = "Платформа тестирования — Вход";
-        Width = 460; Height = 320; MinimumSize = new Size(460, 320);
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        Size = new Size(460, 320);
+        MinimumSize = new Size(460, 320);
+        MaximumSize = new Size(460, 320);
+
         var card = new Panel { Dock = DockStyle.Fill, Padding = new Padding(24), BackColor = Theme.Panel };
         var lay = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 1 };
         lay.Controls.Add(new Label { Text = "Вход", Font = Theme.HeaderFont, AutoSize = true });
         lay.Controls.Add(new Label { Text = "Login" }); lay.Controls.Add(_login);
         lay.Controls.Add(new Label { Text = "Password" }); lay.Controls.Add(_password);
         lay.Controls.Add(Theme.Btn("Войти", OnLogin, true));
+        lay.Controls.Add(new Label
+        {
+            AutoSize = true,
+            ForeColor = Color.FromArgb(71, 85, 105),
+            Margin = new Padding(0, 10, 0, 0),
+            Text = "Demo: admin/admin123, teacher1/teacher123, student1..6/student123"
+        });
         card.Controls.Add(lay);
         Controls.Add(card);
     }
