@@ -336,7 +336,7 @@ public sealed class AttemptForm : Form
     private readonly Button _prev = new() { Text = "Назад" };
     private readonly Button _next = new() { Text = "Далее" };
     private readonly Button _submit = new() { Text = "Отправить" };
-    private readonly Timer _tick = new() { Interval = 1000 };
+    private readonly System.Windows.Forms.Timer _tick = new() { Interval = 1000 };
 
     public AttemptForm(User student, long attemptId)
     {
